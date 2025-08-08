@@ -33,7 +33,7 @@ _GENERIC_ENTITY_TERMS = {
     "cat","cats","dog","dogs","pet","pets","animal","animals","person","people",
     "kid","kids","child","children","man","men","woman","women","guy","guys",
     "photos","photo","pictures","picture","images","image","someone","something",
-    "thing","things","object","objects","place","places"
+    "thing","things","object","objects","place","places" "food"
 }
 _ANYLIKE = {"any", "anything", "whatever", "dont care", "don't care", "na", "n/a", "none", "no preference"}
 
@@ -446,7 +446,7 @@ def cmd_search(cfg, query, topk=None, show=0, gallery=True, debug=False):
     # Components
     text_emb = TextEmbedder(cfg)
     mem = MemoryStore(cfg["memory_path"]).load()
-    
+
     if cfg.get("auto_reindex_on_search", True):
         try:
             _auto_reindex_if_changed(cfg)
