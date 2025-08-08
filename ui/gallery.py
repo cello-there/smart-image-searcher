@@ -1,4 +1,5 @@
 from pathlib import Path
+from html import escape
 from PIL import Image
 
 def _thumb(src: str, outdir: Path, max_px: int) -> Path:
@@ -11,11 +12,10 @@ def _thumb(src: str, outdir: Path, max_px: int) -> Path:
         im = Image.open(src_p).convert("RGB")
         im.thumbnail((max_px, max_px))
         im.save(thumb_p, "JPEG", quality=85)
+        return thumb_p
     except Exception:
-        # If thumbnailing fails, fall back to original image
+        # fallback to original if thumbnailing fails
         return src_p
-    return thumb_p
-
 
 def write_gallery(results, cfg: dict) -> str:
     out_dir = Path("data")
@@ -24,11 +24,14 @@ def write_gallery(results, cfg: dict) -> str:
 
     items = []
     for r in results:
-        tpath = _thumb(r["path"], thumbs, max_px)
+        full_p = Path(r["path"]).resolve()
+        tpath = _thumb(r["path"], thumbs, max_px).resolve()
+
         items.append({
-            "thumb": str(tpath),
-            "full": r["path"],
-            "score": r["score"],
+            "thumb_uri": tpath.as_uri(),     # ✅ URL-encoded file URI
+            "full_uri":  full_p.as_uri(),    # ✅ URL-encoded file URI
+            "full_text": str(full_p),        # for display text only
+            "score":     r["score"],
         })
 
     html = [
@@ -39,15 +42,15 @@ def write_gallery(results, cfg: dict) -> str:
         "<div class='grid'>"
     ]
     for it in items:
-        full_uri = Path(it["full"]).resolve().as_uri()
-        thumb_uri = Path(it["thumb"]).resolve().as_uri()
         html.append(
-            f"<a class='card' href='{full_uri}' target='_blank'>"
-            f"<img src='{thumb_uri}' alt='thumb'/>"
-            f"<div class='meta'>score: {it['score']:.4f}<br/>{it['full']}</div>"
+            f"<a class='card' href='{it['full_uri']}' target='_blank'>"
+            f"<img src='{it['thumb_uri']}' alt='thumb'/>"
+            f"<div class='meta'>score: {it['score']:.4f}<br/>{escape(it['full_text'])}</div>"
             "</a>"
         )
     html.append("</div>")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / "search_results.html"
     out.write_text("\n".join(html), encoding="utf-8")
     return str(out.resolve())

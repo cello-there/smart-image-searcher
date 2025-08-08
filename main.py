@@ -19,6 +19,9 @@ from rag.memory import MemoryStore
 from rag.memory_index import MemoryVectorIndex
 from rag.normalizers import clean_aliases
 from utils.manifest import scan_image_dir, load_manifest, save_manifest, diff_manifests
+from tools.cluster import cluster_images
+from search.embedder import ImageEmbedder  # already used in reindex; needed here too
+
 
 from rag.query_utils import (
     strip_unmentioned_entities,
@@ -652,6 +655,40 @@ def cmd_search(cfg, query, topk=None, show=0, gallery=True, debug=False):
 
 
 
+def cmd_organize(cfg, cluster=False, dry_run=True, apply=False, algo="auto", min_size=5, max_k=40):
+    if not cluster:
+        print("Nothing to do. Use --cluster.")
+        return
+    from organize.cluster import load_vectors, cluster_vectors
+    vecs, ids = load_vectors(cfg)
+    labels, ncl = cluster_vectors(vecs, algo=algo, min_size=min_size, max_k=max_k)
+
+    # Build move plan (simple: ClusterNN)
+    plan = []
+    for path, lab in zip(ids, labels):
+        if lab < 0:
+            continue  # noise
+        dst = Path(cfg["images_root"]) / f"organized/cluster-{lab:02d}" / Path(path).name
+        plan.append((Path(path), dst))
+
+    print(f"Proposed clusters: {ncl} (noise: {(labels<0).sum()})")
+    for src, dst in plan[:40]:
+        print(f"{src}  ->  {dst}")
+    if dry_run:
+        print("\nDry-run only. Use --apply to move files.")
+        return
+    if apply:
+        # minimal safety
+        for _, dst in plan:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+        for src, dst in plan:
+            try:
+                if src.exists():
+                    src.replace(dst)
+            except Exception as e:
+                print(f"Skip {src}: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -666,11 +703,28 @@ def main():
     p_s.add_argument("--topk", type=int, default=None)
     p_s.add_argument("--show", type=int, default=0,
                      help="Open top N results in the default image viewer")
+    # NEW: accept both flags
+    p_s.add_argument("--gallery", dest="gallery", action="store_true",
+                     help="Render an HTML gallery and open it")
     p_s.add_argument("--no-gallery", dest="gallery", action="store_false",
-                     help="Do not open an HTML gallery after search")
+                     help="Disable the HTML gallery")
     p_s.add_argument("--debug", action="store_true",
                      help="Verbose logging + write data/debug/last_query.json")
-    p_s.set_defaults(gallery=True)
+    p_s.set_defaults(gallery=True)  # keep previous default behavior
+
+    p_o = sub.add_parser("organize")
+    p_o.add_argument("--cluster", action="store_true")
+    p_o.add_argument("--apply", action="store_true")
+    p_o.add_argument("--algo", default="auto", choices=["auto","hdbscan","kmeans"])
+    p_o.add_argument("--min-size", type=int, default=5)
+    p_o.add_argument("--max-k", type=int, default=40)
+    p_o.set_defaults(dry_run=True)
+
+    p_c = sub.add_parser("cluster", help="Cluster all images (KMeans)")
+    p_c.add_argument("--k", type=int, default=8)
+    p_c.add_argument("--move", action="store_true", help="Move files into cluster folders under images_root")
+    p_c.add_argument("--out", default="clusters", help="Subfolder name under images_root for moved files")
+    p_c.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
     cfg = load_config("config.json")
@@ -682,6 +736,18 @@ def main():
     elif args.cmd == "search":
         cmd_search(cfg, args.query, topk=args.topk,
                    show=args.show, gallery=args.gallery, debug=args.debug)
+    elif args.cmd == "organize":
+        cmd_organize(cfg, cluster=args.cluster, dry_run=not args.apply, apply=args.apply,
+                     algo=args.algo, min_size=args.min_size, max_k=args.max_k)
+    elif args.cmd == "cluster":
+        # Reuse the same embedder used in reindex so vectors match
+        labels, _, _ = cluster_images(cfg, ImageEmbedder(cfg),
+                                      k=args.k, move=args.move,
+                                      out_root=args.out, dry_run=args.dry_run)
+        if labels.size:
+            print(f"Done. {labels.size} images clustered into {labels.max()+1} groups.")
+
+
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ python-dotenv>=1.0
 faiss-cpu>=1.8.0
 open-clip-torch>=2.24.0
 torch>=2.2
+scikit-learn>=1.4
 # LLM (Ollama local)
 requests>=2.32
 # Utilities
