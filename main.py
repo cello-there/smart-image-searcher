@@ -18,6 +18,7 @@ from rag.augmenter import QueryAugmenter
 from rag.memory import MemoryStore
 from rag.memory_index import MemoryVectorIndex
 from rag.normalizers import clean_aliases
+from utils.manifest import scan_image_dir, load_manifest, save_manifest, diff_manifests
 
 from rag.query_utils import (
     strip_unmentioned_entities,
@@ -36,7 +37,28 @@ _GENERIC_ENTITY_TERMS = {
 }
 _ANYLIKE = {"any", "anything", "whatever", "dont care", "don't care", "na", "n/a", "none", "no preference"}
 
-import re
+def _manifest_path(cfg): 
+    return cfg.get("manifest_path", "data/image_manifest.json")
+
+def _image_dir(cfg):
+    return cfg.get("image_dir", "images")
+
+def _auto_reindex_if_changed(cfg) -> bool:
+    """Scan images/, and if anything changed, run incremental reindex + update manifest."""
+    man_path = _manifest_path(cfg)
+    old = load_manifest(man_path)
+    new = scan_image_dir(_image_dir(cfg))
+    added, removed, modified = diff_manifests(old, new)
+    if added or removed or modified:
+        logger.info(f"[watch] changes detected: +{len(added)} -{len(removed)} ~{len(modified)} — reindexing…")
+        ensure_dir(Path(cfg["index_path"]).parent)
+        ensure_dir(Path(cfg["metadata_csv"]).parent)
+        from search.embedder import ImageEmbedder
+        img_emb = ImageEmbedder(cfg)
+        incremental_reindex(cfg, img_emb, full=False)
+        save_manifest(man_path, new)
+        return True
+    return False
 
 def _is_generic_entity_name(name: str) -> bool:
     if not name:
@@ -83,13 +105,14 @@ def cmd_status(cfg):
         "memory_index_present": mem_idx,
     })
 
-
 def cmd_reindex(cfg, full: bool = False):
     ensure_dir(Path(cfg["index_path"]).parent)
     ensure_dir(Path(cfg["metadata_csv"]).parent)
     from search.embedder import ImageEmbedder
     img_emb = ImageEmbedder(cfg)
     incremental_reindex(cfg, img_emb, full=full)
+    # NEW: refresh manifest after any reindex
+    save_manifest(_manifest_path(cfg), scan_image_dir(_image_dir(cfg)))
 
 
 def _build_memory_index(cfg, text_emb, mem_store: MemoryStore) -> MemoryVectorIndex:
@@ -423,6 +446,13 @@ def cmd_search(cfg, query, topk=None, show=0, gallery=True, debug=False):
     # Components
     text_emb = TextEmbedder(cfg)
     mem = MemoryStore(cfg["memory_path"]).load()
+    
+    if cfg.get("auto_reindex_on_search", True):
+        try:
+            _auto_reindex_if_changed(cfg)
+        except Exception as e:
+            logger.warning(f"[watch] auto-reindex check failed: {e}")
+
 
     # Auto-clean previously saved junk (e.g., sentence-like aliases)
     if hasattr(mem, "sanitize") and mem.sanitize():

@@ -22,5 +22,12 @@
   "rerank_topN": 100,
   "memory_min_sim": 0.20,
   "alias_min_conf": 0.65,
-  "alias_autoconfirm_on_decline": true
+  "alias_autoconfirm_on_decline": true,
+  "image_dir": "images",
+  "index_path": "data/index.faiss",
+  "metadata_csv": "data/image_index.csv",
+  "memory_index_path": "data/memory.faiss",
+  "manifest_path": "data/image_manifest.json",
+  "auto_reindex_on_search": true,
+  "watch_interval_sec": 2
 }
