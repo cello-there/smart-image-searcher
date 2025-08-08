@@ -1,0 +1,22 @@
+{
+  "device": "auto",
+  "clip_model": "ViT-B-32",
+  "index_path": "data/index.faiss",
+  "metadata_csv": "data/image_index.csv",
+  "memory_path": "data/rag_memory.jsonl",
+  "images_root": "images",
+  "topk": 12,
+  "distance": "cosine",
+  "augment_queries": true,
+  "enable_clarifier": true,
+  "thumbnail_max_px": 512,
+  "enable_rerank": false,
+  "enable_memory_write": true,
+  "safe_mode_redact_names": false,
+  "use_ivf": false,
+  "use_opq": false,
+  "llm_provider": "ollama",
+  "llm_model": "mistral",
+  "ollama_host": "http://localhost:11434",
+  "memory_index_path": "data/memory.faiss"
+}

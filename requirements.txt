@@ -1,0 +1,19 @@
+numpy>=1.26
+pillow>=10.0
+pandas>=2.0
+jsonschema>=4.21
+python-dotenv>=1.0
+# Vector + embeddings
+faiss-cpu>=1.8.0
+open-clip-torch>=2.24.0
+torch>=2.2
+# LLM (Ollama local)
+requests>=2.32
+# Utilities
+tenacity>=8.2
+# UI/CLI niceties
+tqdm>=4.66
+
+# Optional cloud providers (leave commented if using Ollama)
+# anthropic>=0.34.1
+# openai>=1.40.0

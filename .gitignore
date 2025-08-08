@@ -1,0 +1,12 @@
+# never commit local media or generated artifacts
+images/
+images/**/*
+data/
+logs/
+*.faiss
+*.tmp
+*.cache
+*.log
+.env
+__pycache__/
+*.pyc
