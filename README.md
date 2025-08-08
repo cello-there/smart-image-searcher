@@ -1,58 +1,30 @@
 # AI Image Searcher V3
 
-A local-first, modular image search system that combines **CLIP embeddings** (for images & text), a **FAISS** vector index, and a lightweight **RAG layer** over personal “memory docs.” The RAG layer uses a local or cloud **LLM** (Ollama Mistral by default) to: (1) expand queries, (2) ask clarifying questions when the intent is vague, (3) infer/normalize entities (like your pets or trip names), and (4) optionally update memory (aliases, attributes) with user consent.
+Local‑first semantic image search using **CLIP** embeddings + **FAISS** with a small **RAG** layer for entities (pets, trips, nicknames). Runs entirely on your machine; no photos leave your box.
 
 ---
 
-## Why this exists
+## Highlights
 
-* **Find your photos faster** using semantic search: “photos of my orange cat at night,” “NYC trip skyline,” etc.
-* **Be precise without hard‑coding:** The LLM does the heavy lifting—clarifying, normalizing terms, and mapping nicknames to canonical entities.
-* **Stay local & private:** Run everything on your machine. Embeddings and indexes live in `data/`. No raw photos are uploaded.
-
----
-
-## Features
-
-* **CLIP-powered semantic search** over your image folders
-* **FAISS index** (with numpy fallback) for fast retrieval
-* **RAG memory** of user-specific entities (e.g., pets, trips) to personalize queries
-* **LLM-driven query augmentation** (no brittle synonym lists)
-* **Clarifying questions** only when needed, guided by memory context
-* **Alias learning** (e.g., “Floof” → “Fluffy”) with opt-in persistence
-* **Modular backends** so you can swap:
-
-  * Embedders (OpenCLIP vs stubs)
-  * LLM provider (Ollama / Anthropic / OpenAI)
-  * Index strategy (FAISS or pure numpy)
-* **HTML gallery** output and/or open top results in your default viewer
-* **Incremental reindex** that only embeds changed/new files
+* **Semantic search**: “photos of my orange cat at night,” “yellow mustard bottle on white background.”
+* **RAG memory**: remembers entities (e.g., *Fluffy* ↔ *Floof*), learns aliases with your approval.
+* **LLM assists**: clarifies vague queries and expands them into better CLIP prompts.
+* **Incremental indexing** with **auto‑detect of stale index** (see below).
+* **Windows‑friendly**: examples use **CMD** (not PowerShell).
 
 ---
 
-## Quickstart
-
-### 1) Install dependencies
+## Install
 
 ```bash
 pip install -r requirements.txt
 ```
 
-> On Windows, PyTorch can be heavy. If you hit install issues, you can still run the random-stub embedders; search will work but be less accurate until PyTorch/OpenCLIP are installed.
+> If PyTorch / open-clip are heavy, you can still run on stub embeddings (slower/less accurate). Install `faiss-cpu` for speed.
 
-### 2) (Optional) Start an LLM locally with Ollama
+---
 
-* Install Ollama and pull a small model (e.g., `mistral`):
-
-```bash
-ollama pull mistral
-```
-
-* Ensure Ollama is running (default host `http://localhost:11434`).
-
-### 3) Configure
-
-Edit `config.json`:
+## Configure (`config.json`)
 
 ```json
 {
@@ -67,125 +39,153 @@ Edit `config.json`:
   "distance": "cosine",
   "augment_queries": true,
   "enable_clarifier": true,
-  "thumbnail_max_px": 512,
   "enable_rerank": false,
   "enable_memory_write": true,
+  "thumbnail_max_px": 512,
   "safe_mode_redact_names": false,
   "use_ivf": false,
   "use_opq": false,
   "llm_provider": "ollama",
   "llm_model": "mistral",
-  "ollama_host": "http://localhost:11434"
+  "ollama_host": "http://localhost:11434",
+  "auto_reindex": true  // optional: reindex on detected changes
 }
 ```
 
-> Point `images_root` to the folder containing your photos. Subfolders are handled automatically.
+**Notes**
 
-### 4) Index images
+* `images_root`: the folder to crawl. Subfolders are included.
+* `auto_reindex`: when `true`, `search` will auto‑reindex if it detects new/changed files (based on signatures). If `false`, you’ll be prompted.
 
-```bash
+---
+
+## Index your photos
+
+### First build
+
+```cmd
 python main.py reindex
 ```
 
-* First run will embed & index all supported images under `images_root`.
-* Subsequent runs only pick up new/modified files (use `--full` for a full rebuild).
+### Force a clean rebuild
 
-### 5) Search
-
-```bash
-python main.py search "photos of my cat at night" --gallery --show 3
+```cmd
+python main.py reindex --full
 ```
 
-* `--gallery` opens an HTML grid of results.
-* `--show N` opens the top N images in your OS default viewer.
+### Auto‑detect behavior
+
+* On `search`, the app compares what’s on disk vs what’s in `data/image_index.csv`.
+* If files were added/renamed/updated:
+
+  * With `auto_reindex: true`, it will run an incremental reindex automatically.
+  * Otherwise, you’ll see a prompt telling you to run `python main.py reindex`.
 
 ---
 
-## How it works
+## Search
 
-### 1) Embedding & Indexing
+```cmd
+python main.py search "photos of my orange cat"
+python main.py search "yellow mustard bottle on white background" --gallery --show 3
+```
 
-* **ImageEmbedder** encodes images (OpenCLIP if available; otherwise a deterministic stub for development).
-* **TextEmbedder** encodes queries into the same vector space.
-* **VectorIndex** stores vectors & ids in FAISS (or numpy fallback) and supports nearest-neighbor search.
-* **incremental\_reindex** walks `images_root`, computes a signature (name+size+mtime), embeds only changed/new files, and updates `data/index.*` plus `data/image_index.csv`.
-
-### 2) Memory (RAG)
-
-* User-specific “memory docs” live in `data/rag_memory.jsonl` (one JSON per line).
-* **MemoryVectorIndex** builds a FAISS/numpy index over textual summaries of these docs for quick retrieval as RAG context.
-* The **Clarifier** and **QueryAugmenter** read this context to:
-
-  * Ask **clarifying questions** only when necessary
-  * Infer canonical entities or **learn aliases** (with your consent)
-  * Normalize queries (“kitty” → cat) without hard-coded lists
-
-### 3) Retrieval
-
-* We optionally clarify the query, augment it using memory context, then embed the final text and search the image index.
-* If enabled, a simple **CLIP re-ranker** can re-score the top K results for better ordering.
-* Finally, we print results and optionally open the **HTML gallery** and/or native image viewer.
+* `--gallery` opens an HTML grid. `--show N` opens the top N images natively.
+* The LLM will only ask clarifying questions when your intent is genuinely ambiguous.
 
 ---
 
-## Memory & Aliases
+## Memory & Aliases (RAG)
 
-* When you mention a new entity (e.g., `Fluffy` the cat), the system can ask a few targeted questions (species, aliases, attributes) and then save a structured entity doc.
-* If you later search for a nickname (e.g., `Floof`), the system may propose linking it as an alias for `Fluffy` and, if you confirm, update the memory record.
-* Memory writing is **opt‑in** (`enable_memory_write: true`) and always asks before persisting changes.
+* Entities you confirm are stored in `data/rag_memory.jsonl`.
+* When you type a nickname (e.g., `Floof`) and we believe it maps to an existing entity (`Fluffy`), you’ll be asked to confirm adding it as an alias.
+* If you type a short form like `J` and decline creating a new entity, the system now **offers to attach it as an alias** to a likely existing entity (e.g., `Jason`).
+* Memory is **opt‑in**; set `enable_memory_write` to control persistence.
 
-### Memory file format (example)
+**Memory example** (`rag_memory.jsonl`):
 
 ```jsonl
-{"type":"entity","name":"fluffy","category":"pet","kind":"cat","aliases":["floof"],"attributes":{"color":"dark grey"},"user_owned":true,"persistent":true}
-{"type":"entity","name":"jason","category":"pet","kind":"cat","aliases":["jas","J"],"attributes":{"color":"orange"},"persistent":true}
+{"type":"entity","name":"Fluffy","category":"pet","kind":"cat","aliases":["Floof"],"attributes":{"color":"dark grey"},"persistent":true}
+{"type":"entity","name":"Jason","category":"pet","kind":"cat","aliases":["J"],"attributes":{"color":"orange"},"persistent":true}
+```
+
+**Auto‑repair**
+
+* On load, memory sanitizes aliases (splits comma/"and", removes sentence‑like junk) and repairs odd attribute keys (e.g., `color|attributes.note` → `color`).
+
+---
+
+## Useful Windows CMD snippets
+
+**Check if a file is indexed**
+
+```cmd
+findstr /i /c:"download (4).jpg" data\image_index.csv
+```
+
+**Delete old FAISS artifacts (if things get weird)**
+
+```cmd
+del /q data\index.faiss 2>nul
+rem (if numpy fallback exists)
+del /q data\index.faiss.npy 2>nul
+
+del /q data\index.faiss.ids 2>nul
+python main.py reindex --full
+```
+
+**Confirm config paths**
+
+```cmd
+type config.json | findstr /i "metadata_csv index_path images_root"
 ```
 
 ---
 
-## Commands
+## FAQ / Troubleshooting
 
-```bash
-# show health of artifacts
-python main.py status
+**I added new photos but search doesn’t find them.**
 
-# (re)index images (incremental)
-python main.py reindex
-python main.py reindex --full   # force rebuild
+* Run: `python main.py reindex` (or enable `auto_reindex`).
+* Verify the file appears in `data/image_index.csv` with `findstr` (see snippet above).
 
-# search
-python main.py search "your query here" --gallery --show 5
-```
+**Gallery opens but images don’t load.**
 
----
+* Thumbnails are written to `data/thumbnails/`. Make sure the original paths printed in the console are valid.
 
-## Configuration notes
+**LLM keeps asking needless questions.**
 
-* **llm\_provider / llm\_model**: choose between `ollama` (default), `anthropic`, or `openai`.
-* For **Ollama**, ensure the model exists locally (`ollama pull mistral`).
-* Set `enable_rerank: true` to use CLIP image embeddings to re-rank the top K.
-* `safe_mode_redact_names: true` will try to avoid injecting entity names into the final query string.
+* That usually means the query is ambiguous (e.g., `photos of J`). Try adding one more hint, or answer the two quick clarifiers. The system won’t ask if memory already disambiguates it.
 
----
+**Aliases attached to the wrong thing.**
 
-## Troubleshooting
+* You can run the same alias again; when prompted, decline new entity and accept the suggested existing entity to attach the alias correctly.
 
-* **No results / weird ordering**: If running without PyTorch/OpenCLIP, you’re using stub embeddings—install Torch & `open-clip-torch`.
-* **FAISS not installed**: We fall back to numpy search (slower). Install `faiss-cpu` for speed.
-* **Main errors with prompts/schemas**: Ensure prompts in `rag/prompts.py` still match what `utils/llm.complete_json` expects (especially keys like `expanded_query`).
-* **Windows path issues**: We normalize paths in the HTML gallery; if a link fails, open the printed path directly.
+**Performance is slow.**
+
+* Install `faiss-cpu` and real CLIP (`torch`, `open-clip-torch`).
 
 ---
 
-## Roadmap / Ideas
+## How it works (short)
 
-* Train a small **re-ranker** tuned to your collection
-* Add **face/subject tagging** via lightweight local models
-* Expose a simple **web UI** for search/history/memory editing
-* Export/import memory as a single JSON for easy backup
+1. **Index** walks `images_root`, computes signatures, embeds new/changed files, and writes:
+
+   * vectors → `data/index.*`
+   * metadata → `data/image_index.csv`
+2. **Memory** builds a tiny FAISS/numpy index over your docs to supply context to the LLM.
+3. **Search** optionally clarifies, augments the query, embeds text, queries FAISS, optionally reranks, then prints/open results.
+
+---
+
+## Roadmap
+
+* Optional web UI
+* Face/person clustering
+* Fine‑tuned re‑ranker
 
 ---
 
 ## License
 
-MIT (adjust as you like). All images remain your property and never leave your machine.
+MIT (images remain your property; nothing is uploaded).
