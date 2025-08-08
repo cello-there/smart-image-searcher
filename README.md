@@ -1,229 +1,205 @@
-# AI Image Searcher
+# Smart Image Searcher
 
-Local, fast image search with CLIP embeddings + FAISS, optional LLM-powered query augmentation and lightweight memory for names/aliases ("Jason" → "J"). Now with safer reindexing, deleted-file pruning, and an experimental clustering workflow for quick albuming.
-
----
-
-## ✨ Features
-
-* **Semantic search** over your `images/` folder with CLIP (OpenCLIP ViT-B/32 by default).
-* **Incremental reindex** (only new/changed files embedded) **+ auto health checks** with a one-flag **full rebuild** when the index/CSV drift.
-* **Deleted-file handling**: when you run a full rebuild, entries for missing files are automatically pruned from both the CSV and the FAISS index.
-* **LLM-assisted queries** (optional): clarify ambiguous queries, expand to better terms.
-* **Lightweight memory**: remember entities (pets, people, objects) and **aliases** ("J" → "Jason").
-* **HTML gallery** with on-the-fly **thumbnails** (no duplicates saved—falls back to originals if thumb fails).
-* **(Experimental) Clustering**: group similar photos to speed up album creation. Preview clusters then move/copy to folders.
-
-> ⚠️ LLM features are optional. If you don’t configure a provider, search still works with local embeddings.
+Semantic search over your local photos using CLIP embeddings + FAISS, with a tiny RAG layer for query clarification and alias learning. Windows-friendly CLI, optional HTML gallery with thumbnails, and (experimental) image clustering.
 
 ---
 
-## 🧰 Requirements
+## Status: what actually works
 
-Install Python 3.10+ and then:
+**Implemented**
+
+* **Incremental (re)indexing** of images in `images/` into a FAISS (or numpy) vector index
+* **Search** by natural language prompt (embeds the text and retrieves nearest images)
+* **Auto-change detection on search**: if files were added/removed/modified since the last index, a quick incremental reindex runs before searching
+* **HTML gallery** output (thumbnails in `data/thumbnails/`, click to open full image)
+* **RAG-lite**: clarifying questions when queries are ambiguous, plus optional alias learning (e.g., “J” → “Jason”) with user confirmation
+* **Clustering** (KMeans) of all images; optional `--move` to group files into cluster folders
+* **Windows CMD-friendly commands** and outputs
+
+**Not (yet) implemented / experimental**
+
+* `organize` command with rule-based destination folders (preview/apply/undo)
+* Delete tombstones & FAISS prune flag (current reindex rewrites metadata and rebuilds/updates vectors; practical deletes work, but explicit `--prune` isn’t shipped)
+* FastAPI desktop/mobile API
+
+---
+
+## Requirements
+
+```
+Python 3.11+
+numpy, pillow, pandas, jsonschema, python-dotenv, faiss-cpu, open-clip-torch, torch, requests, tenacity, tqdm
+```
+
+If `torch`/`open-clip-torch` fail to install on Windows, the code will fall back to deterministic stub embeddings (good for wiring tests; for real results install Torch + open-clip).
+
+Install:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### Included libraries (high level)
-
-* `faiss-cpu` – vector index
-* `open-clip-torch` + `torch` – CLIP embeddings (falls back to deterministic stubs if not installed)
-* `pillow`, `pandas`, `numpy`
-* `tqdm`, `requests`, `tenacity`
-* *(Optional)* `jsonschema` for config validation
-* *(Experimental)* `scikit-learn` for clustering
-
-See `requirements.txt` for exact versions.
-
 ---
 
-## ⚙️ Configure
+## Quick start
 
-Edit `config.json`:
+1. Put some images under `images/` (subfolders OK). Supported: `.jpg .jpeg .png .webp .bmp`.
 
-```jsonc
+2. Configure `config.json` (sample):
+
+```json
 {
-  "device": "auto",                  // "cuda" if you have it, otherwise "cpu"
+  "device": "auto",
   "clip_model": "ViT-B-32",
-  "images_root": "images",          // folder you want to index
-  "index_path": "data/index.faiss", // FAISS index (with .npy/.ids sidecars if FAISS missing)
+  "index_path": "data/index.faiss",
   "metadata_csv": "data/image_index.csv",
   "memory_path": "data/rag_memory.jsonl",
   "memory_index_path": "data/memory.faiss",
+  "images_root": "images",
   "topk": 12,
   "distance": "cosine",
-
-  // LLMs (optional)
-  "augment_queries": true,
+  "thumbnail_max_px": 512,
   "enable_clarifier": true,
+  "enable_rerank": false,
   "enable_memory_write": true,
   "llm_provider": "ollama",
   "llm_model": "mistral",
-  "ollama_host": "http://localhost:11434",
-
-  // UI
-  "thumbnail_max_px": 512,
-  "enable_rerank": false
+  "ollama_host": "http://localhost:11434"
 }
 ```
 
-> Tip (Windows): paths like `C:\\Users\\me\\Pictures` work fine.
-
----
-
-## 🚀 Quickstart (Windows CMD examples)
-
-1. **Index your images** (first run or after big changes):
+3. **Full reindex** (first time):
 
 ```cmd
 python main.py reindex --full
 ```
 
-2. **Search**:
+4. **Search** (with HTML gallery):
 
 ```cmd
-python main.py search "photos of orange cat" --topk 50 --gallery
+python main.py search "photos of cats" --topk 24 --gallery
 ```
 
-3. **Status** (sanity check files exist):
+* Top-N will be printed with scores
+* A gallery opens at `data/search_results.html`
+* Thumbnails are generated under `data/thumbnails/` (reused on subsequent runs)
+
+> Tip: When you add/remove images later, just run `search`—the tool auto-detects changes and reindexes incrementally. If things look off, force a rebuild:
+
+```cmd
+DEL /Q data\index.faiss data\index.faiss.npy data\index.faiss.ids 2>nul
+python main.py reindex --full
+```
+
+---
+
+## CLI Reference (Windows CMD examples)
+
+### Status
 
 ```cmd
 python main.py status
 ```
 
----
+Shows whether the FAISS index, metadata CSV, memory file, and memory index exist.
 
-## 🔁 Indexing Details
-
-### Incremental reindex
+### Reindex
 
 ```cmd
-python main.py reindex
+python main.py reindex            & rem incremental (new/changed only)
+python main.py reindex --full     & rem rebuild from scratch
 ```
 
-* Walks `images_root`, computes a light file signature for each image.
-* Embeds **only** new/changed files and appends them to the vector index.
-* Updates `data/image_index.csv` with the latest file signatures.
+* Writes/updates: `data/index.faiss` (+ `*.ids`/`*.npy` sidecars when FAISS not available) and `data/image_index.csv`
 
-### Full rebuild (purge + rebuild)
+### Search
 
 ```cmd
-python main.py reindex --full
+python main.py search "yellow mustard bottle on white background" --topk 50 --gallery
+python main.py search "photos of J" --show 3 --gallery
 ```
 
-* Recomputes **all** embeddings from the current filesystem snapshot.
-* **Prunes deleted files**: if a file was removed from disk, it disappears from the CSV and the rebuilt vector index.
-* Use this when you mass-delete/move files or suspect index/CSV drift.
+* On first ambiguous queries, you may be asked up to 2 clarifying questions
+* If the model proposes an alias link (e.g., “J” → “Jason”), you’ll be asked to confirm before it’s saved
 
-### Auto health checks
-
-* During reindex, if the saved IDs in `index.faiss(.ids)` don’t align with `image_index.csv`, a **full rebuild** is triggered automatically (or you’ll be prompted, depending on your version).
-* If you ever get weird search results, do a manual reset:
+### Cluster (KMeans)
 
 ```cmd
-del /q data\index.faiss 2>nul
-del /q data\index.faiss.npy 2>nul
-del /q data\index.faiss.ids 2>nul
-python main.py reindex --full
+python main.py cluster --k 8 --dry-run
+python main.py cluster --k 8 --move --out clusters
 ```
+
+* `--dry-run` prints the cluster assignments
+* With `--move`, files are copied/moved into `images/<out>/<cluster-id>/...` (confirm behavior in your local code)
+* Searching continues to work after moving because searches embed current paths; if you move externally, run a quick `reindex`
+
+> **Note:** The `organize` command (rules-driven folder moves) is not shipped yet; clustering is the current grouping tool.
 
 ---
 
-## 🔍 Searching
+## How it works (high-level)
+
+* **Embeddings**: Images and text are embedded by CLIP (OpenCLIP). Cosine similarity (IP on normalized vectors) ranks images.
+* **FAISS index**: Stored at `data/index.faiss` with sidecar files for ids. If FAISS isn’t available, a NumPy index is used.
+* **Metadata CSV**: `data/image_index.csv` maps FAISS ids → image paths and stores file signatures (size & mtime) for incremental updates.
+* **Auto-change detection**: `search` checks for added/removed/modified files and calls incremental reindex before querying.
+* **RAG-lite**: A memory file (`data/rag_memory.jsonl`) stores entity/alias/context tidbits learned via clarifier answers. A tiny text FAISS (or NumPy) index helps surface relevant memory when expanding queries.
+* **Gallery & thumbnails**: `data/search_results.html` links to file:// URIs. Thumbs are generated once and reused; you can change max size via `thumbnail_max_px`.
+
+---
+
+## Troubleshooting
+
+* **Gallery shows broken images**: make sure the paths in `data/image_index.csv` exist; if you moved files outside the tool, run `reindex --full`.
+* **Only one image shows up for everything**: delete `data/index.faiss*` and rebuild with `reindex --full` (usually stale/misaligned vectors).
+* **Faiss install on Windows**: use `pip install faiss-cpu`. GPU FAISS on Windows is tricky; CPU is fine for local collections.
+* **Torch/OpenCLIP install troubles**: you can temporarily comment them in `requirements.txt` and run with stub embeddings to validate the wiring.
+
+---
+
+## Roadmap (“next” branch)
+
+Create and work on a `next` branch for these:
 
 ```cmd
-python main.py search "bread" --topk 100 --gallery --debug
+git checkout -b next
 ```
 
-* `--gallery` writes/opens `data/search_results.html` with thumbnails.
-* `--show N` can open top-N results in your OS viewer.
-* `--debug` logs memory usage, augmentation, the final query, and writes `data/debug/last_query.json`.
+**Sprint 1**
 
-### Query augmentation & clarifier (optional)
+* `organize` command (preview/apply/undo) with a simple rule file, e.g.:
 
-If `enable_clarifier` is true, you might get up to 2 clarifying questions (e.g., "Which J?"), then your query gets rewritten (e.g., "photos of Jason (nicknamed J)").
+  * `dest: "{year}/{month}/{subject|Scenes}/{filename}"`
+  * Subject from memory entity → `People/{name}` or `Pets/{name}`; else a simple scene label; else `Misc`
+* Move log for undo: CSV with `src,dst,hash,timestamp`
+* Duplicates: skip/rename strategies, basic file hash (xxhash/sha1)
 
-### Memory & aliases (optional)
+**Sprint 2**
 
-* The tool tries to **link nicknames** found in a query to known entities.
-* If it proposes a link (e.g., `J → Jason`) it will ask to confirm and then **add the alias** to the entity.
-* When you **decline creating a new entity** (e.g., typed a nickname), it will try to resolve it as an alias and offer to add it to an existing entity instead of saving junk.
+* Delete handling polish: tombstone missing rows and `reindex --prune` to drop them from FAISS cleanly when over a threshold
+* Minimal FastAPI with endpoints:
 
----
+  * `GET /search?q=...`
+  * `POST /reindex` (full/incremental)
+  * `POST /cluster/preview`, `POST /cluster/apply`
 
-## 🧪 Clustering (Experimental)
+**Sprint 3**
 
-Group semantically similar photos (e.g., all the beach shots, all the cat photos) to speed up albuming.
+* Desktop UI shell (Tauri/Electron): Search grid, Library stats, Organize preview
+* “Watch folders” background task to auto reindex on add/remove
+* Tagging pane; optional zero-shot CLIP tags
 
-**Preview clusters and write groups to folders**:
+Open a PR when ready:
 
 ```cmd
-python main.py cluster --k 8 --min 3 --dest "images\clusters" --copy
-```
-
-* `--k` number of clusters (try 6–12 to start)
-* `--min` minimum items to consider a valid cluster
-* `--dest` root folder to create subfolders like `cluster_0001/`
-* `--copy` (default) copies files; use `--move` to move instead
-
-> After previewing, you can rename cluster folders to something human (e.g., `Jason/`, `Mustard/`).
-
-**Note:** Reindex after moving a lot of files so paths/signatures stay in sync:
-
-```cmd
-python main.py reindex --full
+git add -A
+git commit -m "README: mark implemented features; add cluster & gallery; plan next"
+git push -u origin next
 ```
 
 ---
 
-## 🧷 Thumbnails
+## Credits
 
-* Stored under `data/thumbnails/` on demand; if thumbnailing fails, the gallery uses the original image.
-* No extra storage churn for images already small enough.
-
----
-
-## 🛠️ Troubleshooting
-
-**I added new photos but search ignores them**
-
-* Run `python main.py reindex` (incremental). If still off, run a full rebuild.
-
-**Results look wrong / I only get one image for every query**
-
-* Likely an out-of-sync FAISS/CSV. Do a full rebuild (see reset commands above).
-
-**I deleted/moved files but they still appear in results**
-
-* Run `python main.py reindex --full` to rebuild and prune.
-
-**Torch/OpenCLIP won’t install on Windows**
-
-* You can comment them out in `requirements.txt`. The app will use deterministic stub embeddings so you can still test the UX.
-
-**Ollama/LLMs not installed**
-
-* Set `augment_queries: false` and `enable_clarifier: false` or just leave provider unset. Search still works.
-
----
-
-## 🧪 Dev & Tests
-
-* Basic config smoke test:
-
-```bash
-pytest -q
-```
-
-* To inspect the last search pipeline end-to-end, open `data/debug/last_query.json` (written when `--debug` is passed to `search`).
-
----
-
-## 🗺️ Roadmap
-
-* Desktop/mobile app with cluster previews and **drag-to-recluster** UX.
-* Smarter alias learning (regex + LLM) with fewer prompts.
-* Multimodal memory (faces, pets) and per-entity visual descriptors.
-* Background watcher to auto-reindex on file changes.
+* OpenCLIP / FAISS teams
+* Everyone who posted their weird cat pics for testing 🐈‍⬛
