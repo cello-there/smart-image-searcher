@@ -10,7 +10,7 @@
   "augment_queries": true,
   "enable_clarifier": true,
   "thumbnail_max_px": 512,
-  "enable_rerank": false,
+  "enable_rerank": true,
   "enable_memory_write": true,
   "safe_mode_redact_names": false,
   "use_ivf": false,
@@ -18,5 +18,8 @@
   "llm_provider": "ollama",
   "llm_model": "mistral",
   "ollama_host": "http://localhost:11434",
-  "memory_index_path": "data/memory.faiss"
+  "memory_index_path": "data/memory.faiss",
+  "rerank_topN": 100,
+  "memory_min_sim": 0.20,
+  "alias_min_conf": 0.65
 }

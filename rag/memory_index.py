@@ -12,15 +12,14 @@ except Exception:
 
 def _doc_to_text(doc: dict) -> str:
     parts = []
-    for k in ("type", "key", "name", "value"):
-        if k in doc and doc[k]:
-            parts.append(str(doc[k]))
-    if doc.get("aliases"):
-        parts.extend([str(a) for a in doc["aliases"]])
-    if doc.get("tags"):
-        parts.extend([str(t) for t in doc["tags"]])
+    for k in ("type","category","name","kind","description"):
+        v = doc.get(k)
+        if v: parts.append(str(v))
+    parts.extend(map(str, doc.get("aliases") or []))
+    parts.extend(map(str, doc.get("tags") or []))
+    attrs = doc.get("attributes") or {}
+    parts.extend([f"{k}:{v}" for k, v in attrs.items()])
     return " | ".join(parts)
-
 
 class MemoryVectorIndex:
     """FAISS (or numpy) index over memory documents for RAG context."""
