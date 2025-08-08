@@ -2,6 +2,7 @@ import argparse
 import json
 import re
 from pathlib import Path
+from typing import List
 
 from utils.logging import get_logger
 from utils.io import ensure_dir
@@ -16,11 +17,59 @@ from rag.clarifier import Clarifier
 from rag.augmenter import QueryAugmenter
 from rag.memory import MemoryStore
 from rag.memory_index import MemoryVectorIndex
+from rag.normalizers import clean_aliases
 
-from ui.display import present_results
+from rag.query_utils import (
+    strip_unmentioned_entities,
+    split_or_alternatives,
+    merge_results,
+)
 
 logger = get_logger(__name__)
 
+# --- Generic detection helpers ---
+_GENERIC_ENTITY_TERMS = {
+    "cat","cats","dog","dogs","pet","pets","animal","animals","person","people",
+    "kid","kids","child","children","man","men","woman","women","guy","guys",
+    "photos","photo","pictures","picture","images","image","someone","something",
+    "thing","things","object","objects","place","places"
+}
+_ANYLIKE = {"any", "anything", "whatever", "dont care", "don't care", "na", "n/a", "none", "no preference"}
+
+import re
+
+def _is_generic_entity_name(name: str) -> bool:
+    if not name:
+        return True
+    low = name.strip().lower()
+    # single common noun or super generic plural
+    if low in _GENERIC_ENTITY_TERMS:
+        return True
+    # drop obvious plurals of generic things (e.g., "cats", "dogs")
+    if low.endswith("s") and low[:-1] in _GENERIC_ENTITY_TERMS:
+        return True
+    # avoid saving queries that are literally media words like "photos"
+    if re.fullmatch(r"(photos?|pictures?|images?)", low):
+        return True
+    return False
+
+def _is_generic_entity(e: dict, original_query: str) -> bool:
+    name = (e.get("name") or "").strip()
+    if _is_generic_entity_name(name):
+        return True
+    # super weak categories from LLM like "animal|pet" or "specific"
+    cat = (e.get("category") or "").strip().lower()
+    kind = (e.get("kind") or "").strip().lower() if e.get("kind") else ""
+    if "|" in cat or cat in {"generic","specific"}:
+        return True
+    if kind in {"generic","specific"}:
+        return True
+    # If the original query is clearly generic (no proper name, plural common noun), skip memory prompts.
+    tokens = re.findall(r"[a-z]+", original_query.lower())
+    has_proper_name = any(t[0].isupper() for t in original_query.split() if t.isalpha())
+    if not has_proper_name and any(t in _GENERIC_ENTITY_TERMS for t in tokens):
+        return True
+    return False
 
 def cmd_status(cfg):
     index = Path(cfg["index_path"]).exists()
@@ -75,7 +124,7 @@ def _filter_memory(mem_hits, query: str, min_sim: float = 0.30, max_docs: int = 
     q_tokens = set(toks)
     pronoun_present = len(q_tokens & pronouns) > 0
 
-    # First pass: detect if ANY entity name/alias is explicitly in the query
+    # detect if ANY entity name/alias is explicitly in the query
     any_name_mentioned = False
     entity_name_sets = []
     for d, _ in mem_hits:
@@ -122,88 +171,95 @@ def _filter_memory(mem_hits, query: str, min_sim: float = 0.30, max_docs: int = 
     return out[:max_docs]
 
 
-def _strip_unmentioned_entities(original_query: str, expanded_query: str, memory_docs: list[dict]) -> str:
-    import re
-    oq = original_query.lower()
-    eq = expanded_query
-
-    # Build entity -> surface forms (name + aliases)
-    entities = []
-    for d in memory_docs or []:
-        if d.get("type") != "entity":
-            continue
-        forms = []
-        if d.get("name"):
-            forms.append(str(d["name"]))
-        forms += [str(a) for a in (d.get("aliases") or []) if a]
-        if not forms:
-            continue
-        # Consider ENTIRE entity "mentioned" if ANY of its forms appear in the original query.
-        # This keeps "J" / "Jason" when the user typed "jas", after alias learning.
-        mentioned = any(re.search(rf"\b{re.escape(f.lower())}\b", oq) for f in forms)
-        entities.append({"forms": forms, "mentioned": mentioned})
-
-    # Remove ONLY unmentioned forms; keep all forms for mentioned entities
-    for ent in entities:
-        if ent["mentioned"]:
-            continue
-        for form in ent["forms"]:
-            eq = re.sub(rf"\b{re.escape(form)}\b", "", eq, flags=re.IGNORECASE)
-
-    # Clean up connectors and orphaned "named"
-    eq = re.sub(r"\bnamed\s*(?:,|\bor\b|\band\b)?\s*$", " ", eq, flags=re.IGNORECASE)
-    eq = re.sub(r"\s*(?:,|\bor\b|\band\b)\s*(?=(?:,|\bor\b|\band\b|$))", " ", eq, flags=re.IGNORECASE)
-    eq = re.sub(r"\s*(?:,|\bor\b|\band\b)\s*$", "", eq, flags=re.IGNORECASE)
-    eq = re.sub(r"\s{2,}", " ", eq).strip()
-
-    # Fallbacks if we were too aggressive: try dropping just "named ..." tail;
-    # if still too short, fall back to the original user query.
-    if len(re.findall(r"\w+", eq)) < 2:
-        tmp = re.sub(r"\bnamed\b.*$", "", expanded_query, flags=re.IGNORECASE).strip()
-        tmp = re.sub(r"\s{2,}", " ", tmp)
-        if len(re.findall(r"\w+", tmp)) >= 2:
-            return tmp
-        return original_query
-
-    return eq
-
-
 def _maybe_learn_alias(query: str, mem_ctx: list[dict], mem: MemoryStore, clarifier: Clarifier,
                        text_emb, cfg: dict, debug: bool = False) -> list[dict]:
+    import difflib
+
     alias_min_conf = float(cfg.get("alias_min_conf", 0.65))
 
-    # Use entities from filtered context, else fall back to ALL known entities
-    entities_ctx = [d for d in (mem_ctx if mem_ctx else mem.docs) if d.get("type") == "entity"]
+    # Use ALL entities to consider possible links (not just filtered context)
+    entities = [d for d in mem.docs if d.get("type") == "entity" and d.get("name")]
+    if not entities:
+        return mem_ctx
 
-    links = clarifier.propose_alias(query, entities_ctx)
+    # Build canonical forms per entity (lowercased)
+    forms_by_ent: dict[str, set[str]] = {}
+    all_known_forms = set()
+    for d in entities:
+        forms = [str(d.get("name", "")).strip()]
+        forms += [str(a).strip() for a in (d.get("aliases") or [])]
+        forms = [f for f in forms if f]
+        lower = {f.lower() for f in forms}
+        forms_by_ent[d["name"]] = lower
+        all_known_forms |= lower
+
+    # Tokens seen in user query
+    q_lower = query.lower()
+    q_tokens = set(re.findall(r"[a-z0-9']+", q_lower))
+
+    # LLM proposal (optional)
+    links = clarifier.propose_alias(query, entities)
     if debug:
         logger.info(f"[alias.links] {json.dumps(links, ensure_ascii=False)}")
-    changed = False
 
-    for link in links:
+    def _valid_link(ent: str, alias: str, conf: float) -> bool:
+        if not ent or not alias:
+            return False
+        if conf < alias_min_conf:
+            return False
+        a = alias.strip().lower()
+        # alias must appear in the query (token or substring)
+        if a not in q_tokens and a not in q_lower:
+            return False
+        # must point to an existing entity
+        if ent not in forms_by_ent:
+            return False
+        # cannot be identical to any known form for that entity
+        if a in forms_by_ent[ent]:
+            return False
+        # avoid 1-char or very long nonsense
+        if not (2 <= len(a) <= 40):
+            return False
+        return True
+
+    filtered = []
+    for link in links or []:
         ent = (link.get("entity") or "").strip()
         alias = (link.get("alias") or "").strip()
         conf = float(link.get("confidence") or 0.0)
-        if not ent or not alias or conf < alias_min_conf:
-            continue
+        if _valid_link(ent, alias, conf):
+            filtered.append({"entity": ent, "alias": alias, "confidence": conf})
+
+    # Fallback: fuzzy local guess (only if nothing passed filters)
+    if not filtered:
+        novel_tokens = [t for t in q_tokens if t not in all_known_forms]
+        best = None
+        best_ratio = 0.0
+        best_ent = None
+        for tok in novel_tokens:
+            for ent, forms in forms_by_ent.items():
+                for f in forms:
+                    r = difflib.SequenceMatcher(a=tok, b=f).ratio()
+                    if r > best_ratio:
+                        best_ratio, best, best_ent = r, tok, ent
+        min_ratio = float(cfg.get("alias_min_ratio", 0.82))
+        if best and best_ent and best_ratio >= min_ratio:
+            filtered.append({"entity": best_ent, "alias": best, "confidence": best_ratio})
+
+    if not filtered:
+        return mem_ctx
+
+    changed = False
+    for link in filtered:
+        ent = link["entity"]
+        alias = link["alias"]
         yn = input(f"Is '{alias}' a nickname/alias for '{ent}'? (y/N) ").strip().lower()
         if not yn.startswith("y"):
             continue
 
-        # Find the target entity by name (case-insensitive); if missing, create minimal
-        target = None
-        for d in mem.docs:
-            if d.get("type") == "entity" and str(d.get("name", "")).lower() == ent.lower():
-                target = d
-                break
-        if not target:
-            target = {"type": "entity", "name": ent, "aliases": []}
-
-        # Upsert alias – your MemoryStore merge is alias-aware and will union
         mem.upsert({
             "type": "entity",
-            "name": target.get("name"),
-            "kind": target.get("kind"),
+            "name": ent,
             "aliases": [alias],
             "persistent": True,
             "source": "alias-confirm",
@@ -212,7 +268,6 @@ def _maybe_learn_alias(query: str, mem_ctx: list[dict], mem: MemoryStore, clarif
 
     if changed:
         mem.save()
-        # Rebuild memory index and re-filter
         mem_index = _build_memory_index(cfg, text_emb, mem)
         raw_qvec = text_emb.encode_text(query)
         mem_hits = mem_index.search(raw_qvec, topk=8)
@@ -222,6 +277,145 @@ def _maybe_learn_alias(query: str, mem_ctx: list[dict], mem: MemoryStore, clarif
             logger.info(f"[mem_ctx after alias] {json.dumps(mem_ctx, ensure_ascii=False)[:800]}")
     return mem_ctx
 
+def _resolve_alias_target(
+    alias: str,
+    mem: MemoryStore,
+    clarifier: Clarifier,
+    query: str,
+    cfg: dict,
+    debug: bool = False,
+    mem_ctx: list[dict] | None = None,
+) -> str | None:
+    """
+    Map `alias` to an existing entity name.
+
+    Rules:
+    - If alias is a single character and exactly one entity name starts with it, prefer that.
+    - Otherwise score candidates with simple heuristics + (optionally) LLM proposals.
+    - Return canonical entity name or None if not confident.
+    """
+    alias_raw = (alias or "").strip()
+    alias_l = alias_raw.lower()
+    if not alias_l:
+        return None
+
+    ents = [d for d in mem.docs if d.get("type") == "entity" and d.get("name")]
+    if not ents:
+        return None
+
+    # ---- Heuristic 1: single-letter initials win if unique ----
+    if len(alias_l) == 1:
+        starts = [d["name"] for d in ents if isinstance(d.get("name"), str) and d["name"][:1].lower() == alias_l]
+        if len(starts) == 1:
+            if debug: logger.info(f"[alias.resolve] single-letter initial unique -> {starts[0]}")
+            return starts[0]
+        # if not unique, we won't trust LLM blindly; we’ll keep scoring below
+
+    # Optional: grab LLM proposals (but don't trust blindly)
+    llm_links = clarifier.propose_alias(query, ents) or []
+    if debug:
+        logger.info(f"[alias.resolve.llm_links] {llm_links}")
+
+    llm_conf: dict[str, float] = {}
+    for link in llm_links:
+        ent = (link.get("entity") or "").strip()
+        al  = (link.get("alias") or "").strip().lower()
+        conf = float(link.get("confidence") or 0.0)
+        if al == alias_l and ent:
+            # keep max conf per ent
+            llm_conf[ent] = max(llm_conf.get(ent, 0.0), conf)
+
+    # Prep scoring
+    q_l = query.lower()
+    mem_ctx_names = {d.get("name") for d in (mem_ctx or []) if d.get("type") == "entity"}
+
+    def score_entity(name: str, doc: dict) -> float:
+        s = 0.0
+        n_l = name.lower()
+        # Strong signals
+        if n_l.startswith(alias_l): s += 3.0
+        if alias_l in n_l:          s += 1.0
+        # If alias already in aliases (rare in this flow) – de-prioritize (means nothing to add)
+        aliases = {str(a).lower() for a in (doc.get("aliases") or []) if a}
+        if alias_l in aliases: s -= 1.0
+        # Memory-context boost
+        if name in mem_ctx_names: s += 0.5
+        # Name mentioned in query?
+        if name.lower() in q_l: s += 0.5
+        # LLM nudge (weak)
+        if name in llm_conf:
+            # cap tiny nudge; we don't let it override initials when wrong
+            s += min(llm_conf[name], 0.6)
+        return s
+
+    candidates = [(score_entity(d["name"], d), d["name"]) for d in ents]
+    candidates.sort(reverse=True)  # highest score first
+
+    if debug:
+        logger.info(f"[alias.resolve.scores] {candidates[:5]}")
+
+    best_score, best_name = candidates[0]
+    # require minimum confidence; initials/path-based usually >= 2–3
+    threshold = 1.5 if len(alias_l) > 1 else 2.5
+    return best_name if best_score >= threshold else None
+
+
+def _add_alias_for_entity(entity_name: str, alias: str, mem: MemoryStore, debug: bool = False):
+    """Persist alias to existing entity."""
+    mem.upsert({
+        "type": "entity",
+        "name": entity_name,
+        "aliases": [alias],
+        "persistent": True,
+        "source": "alias-confirm",
+        "user_owned": True,
+    })
+    mem.save()
+    if debug:
+        logger.info(f"[alias.added] {alias} -> {entity_name}")
+
+
+def _maybe_learn_alias_from_answers(answers: dict, mem: MemoryStore, debug: bool = False):
+    """
+    Parse clarifier answers like 'J is the nickname of Jason' and add alias.
+    Rule-based (no LLM) so it won't hallucinate.
+    """
+    if not answers:
+        return
+
+    text = " ".join(str(v) for v in answers.values() if v).strip()
+    if not text:
+        return
+
+    # common patterns: "J is the nickname of Jason", "J is short for Jason", "J = Jason"
+    patterns = [
+        # "J is a/the nickname of/for Jason" | "J is alias of/for Jason" | "J is short for Jason" | "J is aka Jason"
+        r"^\s*(?P<alias>[A-Za-z0-9'._-]{1,40})\s+(?:is|=)\s+(?:a|the\s+)?(?:nickname|alias|short\s*for|aka)\s+(?:of|for)?\s*(?P<name>[A-Za-z0-9 _'-]{2,80})\s*$",
+        # "J = Jason"
+        r"^\s*(?P<alias>[A-Za-z0-9'._-]{1,40})\s*=\s*(?P<name>[A-Za-z0-9 _'-]{2,80})\s*$",
+        # "Jason aka J"
+        r"^\s*(?P<name>[A-Za-z0-9 _'-]{2,80})\s+(?:aka|also\s+known\s+as)\s+(?P<alias>[A-Za-z0-9'._-]{1,40})\s*$",
+    ]
+
+    m = None
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            break
+    if not m:
+        return
+
+    alias = (m.group("alias") or "").strip().strip("'\"")
+    name  = (m.group("name")  or "").strip().strip("'\"")
+    if not alias or not name:
+        return
+
+    # Does `name` exist as an entity?
+    for d in mem.docs:
+        if d.get("type") == "entity" and str(d.get("name","")).strip().lower() == name.lower():
+            _add_alias_for_entity(d["name"], alias, mem, debug=debug)
+            return
+
 def cmd_search(cfg, query, topk=None, show=0, gallery=True, debug=False):
     topk = topk or cfg.get("topk", 12)
     dbg = {"raw_query": query}
@@ -229,6 +423,11 @@ def cmd_search(cfg, query, topk=None, show=0, gallery=True, debug=False):
     # Components
     text_emb = TextEmbedder(cfg)
     mem = MemoryStore(cfg["memory_path"]).load()
+
+    # Auto-clean previously saved junk (e.g., sentence-like aliases)
+    if hasattr(mem, "sanitize") and mem.sanitize():
+        mem.save()
+
     clarifier = Clarifier(cfg)
     augmenter = QueryAugmenter(cfg)
 
@@ -243,16 +442,19 @@ def cmd_search(cfg, query, topk=None, show=0, gallery=True, debug=False):
         logger.info(f"[mem_ctx filtered] {json.dumps(mem_ctx, ensure_ascii=False)[:800]}")
     dbg["memory_ctx"] = mem_ctx
 
-    #check if new memory is adding details to a previous one
+    # Learn aliases (safe, confirmed)
     mem_ctx = _maybe_learn_alias(query, mem_ctx, mem, clarifier, text_emb, cfg, debug)
 
-    # --- New: collect ephemeral entities (ask questions even if user declines saving)
-    ephemeral_ents = []
+    # (Keep for augmenter context if you ever need it later)
+    ephemeral_ents: List[dict] = []
 
     # Detect new entities mentioned in the query that aren't in memory yet
     new_ents = clarifier.find_new_entities(query, mem_ctx)
     if debug:
         logger.info(f"[new_entities_from_query] {json.dumps(new_ents, ensure_ascii=False)}")
+
+    # Drop generic/common-noun “entities” like cats/dogs/photos/images/etc.
+    new_ents = [e for e in (new_ents or []) if not _is_generic_entity(e, query)]
 
     if cfg.get("confirm_new_entities", True) and new_ents:
         print("I think you mentioned something new:")
@@ -260,77 +462,73 @@ def cmd_search(cfg, query, topk=None, show=0, gallery=True, debug=False):
             label = e.get("name")
             cat = e.get("category")
             kind = e.get("kind")
-            yn = input(f"- Should I remember '{label}'? (y/N) ").strip().lower()
 
-            # Ask the LLM for targeted questions + a draft entity record (for both Yes/No paths)
+            yn = input(f"- Should I remember '{label}'? (y/N) ").strip().lower()
+            if not yn.startswith("y"):
+                target = _resolve_alias_target(label, mem, clarifier, query, cfg, debug, mem_ctx=mem_ctx)
+
+                # Never auto-confirm super-short aliases (e.g., "J")
+                min_chars = int(cfg.get("alias_min_chars_for_autoconfirm", 2))
+                can_autoconfirm = cfg.get("alias_autoconfirm_on_decline", False) and len(label.strip()) >= min_chars
+
+                if target:
+                    if can_autoconfirm:
+                        _add_alias_for_entity(target, label, mem, debug=debug)
+                    else:
+                        yn2 = input(f"  · Add '{label}' as an alias for '{target}'? (y/N) ").strip().lower()
+                        if yn2.startswith("y"):
+                            _add_alias_for_entity(target, label, mem, debug=debug)
+                # If no confident target, do nothing (don’t save junk doc)
+                continue
+
+
+            # User said YES -> enrich + upsert
             enrich = clarifier.enrich_entity(label, cat, kind, mem_ctx, query)
             ent = enrich.get("entity", {}) or {}
             qs = enrich.get("questions", []) or []
 
-            def _make_ent_doc(source_tag: str) -> dict:
-                return {
-                    "type": "entity",
-                    "name": label,
-                    "category": ent.get("category") or cat or "pet",
-                    "kind": ent.get("kind") or kind,
-                    "aliases": ent.get("aliases") or [],
-                    "attributes": ent.get("attributes") or {},
-                    "tags": ent.get("tags") or [],
-                    "description": ent.get("description") or "",
-                    "user_owned": True,
-                    "source": source_tag,
-                    "persistent": (source_tag == "confirm"),
-                }
+            ent_doc = {
+                "type": "entity",
+                "name": label,
+                "category": ent.get("category") or cat or None,
+                "kind": ent.get("kind") or kind,
+                "aliases": ent.get("aliases") or [],
+                "attributes": ent.get("attributes") or {},
+                "tags": ent.get("tags") or [],
+                "description": ent.get("description") or "",
+                "user_owned": True,
+                "source": "confirm",
+                "persistent": True,
+            }
 
-            ent_doc = _make_ent_doc("confirm" if yn.startswith("y") else "ephemeral")
-
-            # Helper to set values via dotted keys (e.g., attributes.color / aliases)
-            def _assign(doc: dict, key: str, value: str):
-                if not value:
-                    return
-                if key == "kind":
-                    doc["kind"] = value
-                elif key == "aliases":
-                    parts = [a.strip() for a in value.split(",") if a.strip()]
-                    doc["aliases"] = sorted(set((doc.get("aliases") or []) + parts))
-                elif key.startswith("attributes."):
-                    k = key.split(".", 1)[1]
-                    doc.setdefault("attributes", {})[k] = value
-                elif key == "attributes":
-                    if isinstance(value, str):
-                        doc.setdefault("attributes", {})["note"] = value
-
-            # Ask targeted questions (up to 3) even if user chose not to save
+            # Ask targeted questions (up to 3)
             for q in qs[:3]:
-                qtxt = q.get("q")
-                key = q.get("key") or ""
+                qtxt = q.get("q"); key = q.get("key") or ""
                 if not qtxt:
                     continue
                 ans = input(f"  · {qtxt} ").strip()
-                _assign(ent_doc, key, ans)
-
-            # If kind is still missing, ask a generic species question once
-            if not ent_doc.get("kind"):
-                ans = input("  · What species/kind is it? (e.g., cat, dog, bread) ").strip()
-                if ans:
+                if not ans:
+                    continue
+                if key == "kind":
                     ent_doc["kind"] = ans
+                elif key == "aliases":
+                    parts = [a.strip() for a in ans.split(",") if a.strip()]
+                    ent_doc["aliases"] = sorted(set((ent_doc.get("aliases") or []) + parts))
+                elif key.startswith("attributes."):
+                    k = key.split(".", 1)[1]
+                    ent_doc.setdefault("attributes", {})[k] = ans
+                elif key == "attributes":
+                    ent_doc.setdefault("attributes", {})["note"] = ans
 
-            if yn.startswith("y"):
-                # Save to memory
-                mem.upsert(ent_doc)
-            else:
-                # Keep for this search only
-                ephemeral_ents.append(ent_doc)
+            mem.upsert(ent_doc)
 
-        # Persist memory (if any added) and refresh memory ctx
+        # Persist + refresh ONCE after processing all new-entity candidates
         mem.save()
         mem_index = _build_memory_index(cfg, text_emb, mem)
         mem_hits = mem_index.search(text_emb.encode_text(query), topk=8)
         mem_ctx = _filter_memory(mem_hits, query, min_sim=min_sim, max_docs=5, debug=debug, logger=logger)
         if debug:
             logger.info(f"[mem_ctx after new-entity confirm] {json.dumps(mem_ctx, ensure_ascii=False)[:800]}")
-            if ephemeral_ents:
-                logger.info(f"[ephemeral_entities] {json.dumps(ephemeral_ents, ensure_ascii=False)[:800]}")
 
     # Clarify if ambiguous (with filtered memory)
     if cfg.get("enable_clarifier", True) and clarifier.is_ambiguous(query, {"memory": mem_ctx}):
@@ -342,27 +540,35 @@ def cmd_search(cfg, query, topk=None, show=0, gallery=True, debug=False):
             answers = {q: input(f"- {q} ") for q in qs}
             if debug:
                 logger.info(f"[clarifier.answers] {answers}")
+
             query = clarifier.incorporate_answers(query, answers)
             if debug:
                 logger.info(f"[clarifier.rewritten_query] {query}")
             dbg["clarifier"] = {"questions": qs, "answers": answers, "rewritten_query": query}
 
+            # (NEW) Learn aliases from free-form answers like “J is a nickname of Jason”
+            _maybe_learn_alias_from_answers(answers, mem, debug=debug)
+
+            # Optional: structured memory write
             if cfg.get("enable_memory_write", True):
                 mem.upsert_from_answers(answers)
-                mem.save()
-                mem_index = _build_memory_index(cfg, text_emb, mem)
-                mem_hits = mem_index.search(text_emb.encode_text(query), topk=8)
-                mem_ctx = _filter_memory(mem_hits, query, min_sim=min_sim, max_docs=5, debug=debug, logger=logger)
-                if debug:
-                    logger.info(f"[mem_ctx post-write] {json.dumps(mem_ctx, ensure_ascii=False)[:800]}")
+
+            # Persist & refresh ONCE after both of the above
+            mem.save()
+            mem_index = _build_memory_index(cfg, text_emb, mem)
+            mem_hits = mem_index.search(text_emb.encode_text(query), topk=8)
+            mem_ctx = _filter_memory(mem_hits, query, min_sim=min_sim, max_docs=5, debug=debug, logger=logger)
+            if debug:
+                logger.info(f"[mem_ctx post-write] {json.dumps(mem_ctx, ensure_ascii=False)[:800]}")
 
     # Augment (include filtered memory + ephemeral entities)
     ctx = {"memory": mem_ctx, "ephemeral_entities": ephemeral_ents}
     aug = augmenter.expand(query, ctx)
     final_query = aug.get("expanded_query", query)
 
+    # Sanitize entity forms the user did not mention
     final_query_before_sanitize = final_query
-    final_query = _strip_unmentioned_entities(query, final_query, mem_ctx)
+    final_query = strip_unmentioned_entities(query, final_query, mem_ctx)
     if debug and final_query != final_query_before_sanitize:
         logger.info(f"[final_query sanitized] {final_query_before_sanitize}  ->  {final_query}")
 
@@ -379,11 +585,20 @@ def cmd_search(cfg, query, topk=None, show=0, gallery=True, debug=False):
             json.dumps(dbg, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-    # Embed & retrieve
-    qvec = text_emb.encode_text(final_query)
+    # Embed & retrieve — split on standalone 'or' and merge results
+    alt_queries = split_or_alternatives(final_query)
+    if debug and len(alt_queries) > 1:
+        logger.info(f"[final_query.split_or] {alt_queries}")
+
     index = VectorIndex.from_config(cfg)
     retriever = Retriever(index, cfg["metadata_csv"], distance=cfg.get("distance", "cosine"))
-    results = retriever.search(qvec, topk=topk)
+
+    result_lists = []
+    for aq in alt_queries:
+        qvec = text_emb.encode_text(aq)
+        result_lists.append(retriever.search(qvec, topk=topk))
+
+    results = merge_results(result_lists, topk=topk)
 
     # Optional CLIP reranker
     if cfg.get("enable_rerank", False) and results:
@@ -392,7 +607,8 @@ def cmd_search(cfg, query, topk=None, show=0, gallery=True, debug=False):
         topN = min(cfg.get("rerank_topN", 100), len(results))
         paths = [r["path"] for r in results[:topN]]
         ivecs = img_emb.encode_images(paths)         # (N, d) L2-normalized by embedder
-        s = ivecs @ qvec.astype("float32")           # cosine vs normalized qvec
+        qvec_full = text_emb.encode_text(final_query)  # rerank against the full sanitized query
+        s = ivecs @ qvec_full.astype("float32")      # cosine vs normalized qvec
         for i, score in enumerate(s.tolist()):
             results[i]["score"] = float(score)
         results[:topN] = sorted(results[:topN], key=lambda r: r["score"], reverse=True)
@@ -401,7 +617,9 @@ def cmd_search(cfg, query, topk=None, show=0, gallery=True, debug=False):
     for r in results:
         print(f"{r['score']:.4f}\t{r['path']}")
 
+    from ui.display import present_results
     present_results(results, cfg, show=show, gallery=gallery)
+
 
 
 def main():

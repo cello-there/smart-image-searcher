@@ -21,5 +21,6 @@
   "memory_index_path": "data/memory.faiss",
   "rerank_topN": 100,
   "memory_min_sim": 0.20,
-  "alias_min_conf": 0.65
+  "alias_min_conf": 0.65,
+  "alias_autoconfirm_on_decline": true
 }
